@@ -2492,6 +2492,262 @@ do
     })
 end
 
+
+------------------------------------------------------------------------
+-- TAB: NOLI - NOVA SILENT AIM
+------------------------------------------------------------------------
+local tabNoliNova = win:Tab({ Title = "Noli Nova", Icon = "zap" })
+
+do
+    local nova = {
+        enabled = cfg.get("novaSilentAimEnabled", false),
+        prediction = cfg.get("novaPrediction", 0.55),
+        aimOffsetY = cfg.get("novaAimOffsetY", -0.4),
+        holdDuration = cfg.get("novaHoldDuration", 0.85),
+        autoFire = cfg.get("novaAutoFire", true),
+        
+        patched = false,
+        remoteEvent = nil,
+        networkRF = nil,
+        originalOnClientInvoke = nil,
+        motionData = {},
+        unloaded = false,
+    }
+
+    -- Find remotes (same as Jane Doe)
+    pcall(function()
+        local net = svc.RS:WaitForChild("Modules", 8):WaitForChild("Network", 8):WaitForChild("Network", 8)
+        nova.remoteEvent = net:WaitForChild("RemoteEvent", 5)
+        nova.networkRF   = net:WaitForChild("RemoteFunction", 5)
+    end)
+
+    local function isNoli()
+        local ch = lp.Character
+        if not ch then return false end
+        local folder = svc.WS:FindFirstChild("Players") and svc.WS.Players:FindFirstChild("Killers")
+        return folder and ch:IsDescendantOf(folder) and ch.Name:lower():find("noli") \~= nil
+    end
+
+    local function getNearestSurvivor(fromPos)
+        local folder = svc.WS:FindFirstChild("Players") and svc.WS.Players:FindFirstChild("Survivors")
+        if not folder then return nil end
+        local nearest, bestDist = nil, math.huge
+        for _, model in ipairs(folder:GetChildren()) do
+            local hrp = model:FindFirstChild("HumanoidRootPart")
+            local hum = model:FindFirstChildOfClass("Humanoid")
+            if hrp and hum and hum.Health > 0 then
+                local dist = (hrp.Position - fromPos).Magnitude
+                if dist < bestDist then
+                    bestDist = dist
+                    nearest = hrp
+                end
+            end
+        end
+        return nearest
+    end
+
+    local function getVelocity(hrp)
+        local now = tick()
+        local pos = hrp.Position
+        local data = nova.motionData[hrp]
+        if not data then
+            nova.motionData[hrp] = {lastPos = pos, lastTime = now, velocity = Vector3.zero}
+            return Vector3.zero
+        end
+        local dt = now - data.lastTime
+        if dt <= 0 then return data.velocity end
+        local vel = (pos - data.lastPos) / dt
+        data.lastPos = pos
+        data.lastTime = now
+        data.velocity = vel
+        return vel
+    end
+
+    -- Random buffer for UseActorAbility (Nova throw)
+    local function createRandomNovaBuffer()
+        local buf = buffer.create(8)
+        -- Random 64-bit value (looks like a real ability ID to the server)
+        buffer.writeu32(buf, 0, math.random(0, 0xFFFFFFFF))
+        buffer.writeu32(buf, 4, math.random(0, 0xFFFFFFFF))
+        return buf
+    end
+
+    local function fireNova()
+        if not nova.remoteEvent then return end
+        local buf = createRandomNovaBuffer()
+        nova.remoteEvent:FireServer("UseActorAbility", { buf })
+    end
+
+    -- Silent aim camera override (only when game requests GetCameraCF)
+    local function buildSilentCamCF(myHRP, targetHRP)
+        if not myHRP or not targetHRP then return nil end
+
+        local hum = myHRP.Parent and myHRP.Parent:FindFirstChildOfClass("Humanoid")
+        local hipHeight = hum and hum.HipHeight or 1.35
+        local spawnOffset = (hipHeight + myHRP.Size.Y / 2) / 2
+
+        local spawnPos = myHRP.CFrame.Position + Vector3.new(0, spawnOffset, 0)
+        local vel = getVelocity(targetHRP)
+        local predicted = targetHRP.Position + vel * nova.prediction
+        local targetPos = predicted + Vector3.new(0, nova.aimOffsetY, 0)
+
+        local delta = targetPos - spawnPos
+        local flat = Vector3.new(delta.X, 0, delta.Z)
+        local dx = flat.Magnitude
+        local dy = delta.Y
+
+        if dx < 0.01 then
+            return CFrame.lookAt(svc.WS.CurrentCamera.CFrame.Position, spawnPos + (dy >= 0 and Vector3.new(0,1,0) or Vector3.new(0,-1,0)))
+        end
+
+        local flatDir = flat.Unit
+        local v0 = 250   -- Nova throw speed (tuned for the ability)
+        local g  = 40    -- gravity approximation
+
+        local v2 = v0 * v0
+        local disc = v2 * v2 - g * (g * dx * dx + 2 * dy * v2)
+        local theta = (disc < 0) and math.atan2(dy, dx) or math.atan2(v2 - math.sqrt(disc), g * dx)
+
+        local T = math.tan(theta)
+        local alpha = math.abs(3 + T) < 0.0001 and -math.pi/2 or math.atan2(3*T - 1, 3 + T)
+
+        local yawCF = CFrame.lookAt(svc.WS.CurrentCamera.CFrame.Position, svc.WS.CurrentCamera.CFrame.Position + flatDir)
+        return yawCF * CFrame.Angles(alpha, 0, 0)
+    end
+
+    local function applyNovaPatch()
+        if nova.patched or not nova.networkRF then return end
+        nova.originalOnClientInvoke = nova.networkRF.OnClientInvoke
+        nova.networkRF.OnClientInvoke = function(reqName, ...)
+            if reqName == "GetCameraCF" and nova.enabled and isNoli() then
+                local char = lp.Character
+                local myHRP = char and char:FindFirstChild("HumanoidRootPart")
+                if myHRP then
+                    local target = getNearestSurvivor(myHRP.Position)
+                    if target then
+                        local cf = buildSilentCamCF(myHRP, target)
+                        if cf then return cf end
+                    end
+                end
+            end
+            if nova.originalOnClientInvoke then
+                return nova.originalOnClientInvoke(reqName, ...)
+            end
+        end
+        nova.patched = true
+    end
+
+    local function removeNovaPatch()
+        if not nova.patched then return end
+        pcall(function()
+            if nova.networkRF then
+                nova.networkRF.OnClientInvoke = nova.originalOnClientInvoke
+            end
+        end)
+        nova.patched = false
+    end
+
+    -- Auto-fire loop (optional)
+    task.spawn(function()
+        while not nova.unloaded do
+            task.wait(0.08)
+            if not nova.enabled or not nova.autoFire or not isNoli() then continue end
+            local char = lp.Character
+            if char and char:FindFirstChild("HumanoidRootPart") then
+                fireNova()
+                task.wait(nova.holdDuration)
+            end
+        end
+    end)
+
+    -- Character watcher
+    task.spawn(function()
+        local lastChar = nil
+        while not nova.unloaded do
+            task.wait(0.4)
+            local cur = lp.Character
+            if cur \~= lastChar then
+                nova.motionData = {}
+                if lastChar then removeNovaPatch() end
+                lastChar = cur
+                if cur and nova.enabled and isNoli() then
+                    applyNovaPatch()
+                end
+            end
+        end
+    end)
+
+    -- UI
+    local secNova = tabNoliNova:Section({ Title = "Nova Silent Aim", Opened = true })
+
+    secNova:Toggle({
+        Title = "Enable Nova Silent Aim",
+        Type = "Checkbox",
+        Default = nova.enabled,
+        Callback = function(on)
+            nova.enabled = on
+            cfg.set("novaSilentAimEnabled", on)
+            if on and isNoli() then
+                applyNovaPatch()
+            else
+                removeNovaPatch()
+            end
+        end
+    })
+
+    secNova:Toggle({
+        Title = "Auto Fire Nova",
+        Type = "Checkbox",
+        Default = nova.autoFire,
+        Callback = function(on)
+            nova.autoFire = on
+            cfg.set("novaAutoFire", on)
+        end
+    })
+
+    secNova:Slider({
+        Title = "Prediction",
+        Step = 0.01,
+        Value = { Min = 0.0, Max = 2.0, Default = nova.prediction },
+        Callback = function(v)
+            nova.prediction = v
+            cfg.set("novaPrediction", v)
+        end
+    })
+
+    secNova:Slider({
+        Title = "Aim Offset Y",
+        Step = 0.1,
+        Value = { Min = -5.0, Max = 5.0, Default = nova.aimOffsetY },
+        Callback = function(v)
+            nova.aimOffsetY = v
+            cfg.set("novaAimOffsetY", v)
+        end
+    })
+
+    secNova:Slider({
+        Title = "Hold Duration (s)",
+        Step = 0.05,
+        Value = { Min = 0.3, Max = 2.0, Default = nova.holdDuration },
+        Callback = function(v)
+            nova.holdDuration = v
+            cfg.set("novaHoldDuration", v)
+        end
+    })
+
+    secNova:Button({
+        Title = "Manual Nova Fire (Test)",
+        Callback = function()
+            if isNoli() then fireNova() end
+        end
+    })
+
+    -- Cleanup on unload
+    lp.CharacterRemoving:Connect(function()
+        nova.motionData = {}
+    end)
+end
+
 ------------------------------------------------------------------------
 ------------------------------------------------------------------------
 -- TAB: INTERFACE
